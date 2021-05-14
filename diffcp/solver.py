@@ -10,6 +10,7 @@ import ray
 import scipy as sp
 import scipy.sparse as sparse
 import scipy.sparse.linalg as splinalg
+import superscs
 import scs
 import tqdm
 from threadpoolctl import threadpool_limits
@@ -241,14 +242,21 @@ def solve_internal(
             data["s"] = warm_start[2]
 
         kwargs.setdefault("verbose", False)
-        result = scs.solve(data, cone_dict, **kwargs)
-
+        try:
+            kwargs['memory'] = 50
+            result = superscs.solve(data, cone_dict, **kwargs)
+        except:
+            print('Running with scs')
+            kwargs.pop('memory')
+            result = scs.solve(data, cone_dict, **kwargs)
         status = result["info"]["status"]
+        '''
         if status == "Solved/Inaccurate" and "acceleration_lookback" not in kwargs:
             # anderson acceleration is sometimes unstable
             warnings.warn("Solved/Inaccurate 2.")
             result = scs.solve(data, cone_dict, acceleration_lookback=0, **kwargs)
             status = result["info"]["status"]
+       '''
 
         if status == "Solved/Inaccurate":
             warnings.warn("Solved/Inaccurate.")
