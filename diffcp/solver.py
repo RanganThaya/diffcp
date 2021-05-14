@@ -1,9 +1,11 @@
 import multiprocessing as mp
 import os
 import warnings
+from collections import defaultdict
 from multiprocessing.pool import ThreadPool
 
 import _diffcp
+import cvxpy.settings as cp_settings
 import ecos
 import numpy as np
 import ray
@@ -12,15 +14,80 @@ import scipy.sparse as sparse
 import scipy.sparse.linalg as splinalg
 import scs
 import tqdm
+from cvxpy.reductions.cone2cone import affine2direct as a2d
+from cvxpy.reductions.solution import Solution
+from cvxpy.reductions.solvers.conic_solvers.mosek_conif import MOSEK
 from threadpoolctl import threadpool_limits
 
 import diffcp.cones as cone_lib
 
 
+def recover_primal_variables(task, sol, K_dir):
+    # This function applies both when slacks are introduced, and
+    # when the problem is dualized.
+    prim_vars = dict()
+    idx = 0
+    m_free = K_dir[a2d.FREE]
+    if m_free > 0:
+        temp = [0.0] * m_free
+        task.getxxslice(sol, idx, len(temp), temp)
+        prim_vars[a2d.FREE] = np.array(temp)
+        idx += m_free
+    if task.getnumintvar() > 0:
+        return prim_vars  # Skip the slack variables.
+    m_pos = K_dir[a2d.NONNEG]
+    if m_pos > 0:
+        temp = [0.0] * m_pos
+        task.getxxslice(sol, idx, idx + m_pos, temp)
+        prim_vars[a2d.NONNEG] = np.array(temp)
+        idx += m_pos
+    num_soc = len(K_dir[a2d.SOC])
+    if num_soc > 0:
+        soc_vars = []
+        for dim in K_dir[a2d.SOC]:
+            temp = [0.0] * dim
+            task.getxxslice(sol, idx, idx + dim, temp)
+            soc_vars.append(np.array(temp))
+            idx += dim
+        prim_vars[a2d.SOC] = soc_vars
+    num_dexp = K_dir[a2d.DUAL_EXP]
+    if num_dexp > 0:
+        temp = [0.0] * (3 * num_dexp)
+        task.getxxslice(sol, idx, idx + len(temp), temp)
+        temp = np.array(temp)
+        perm = expcone_permutor(num_dexp, MOSEK.EXP_CONE_ORDER)
+        prim_vars[a2d.DUAL_EXP] = temp[perm]
+        idx += 3 * num_dexp
+    num_dpow = len(K_dir[a2d.DUAL_POW3D])
+    if num_dpow > 0:
+        temp = [0.0] * (3 * num_dpow)
+        task.getxxslice(sol, idx, idx + len(temp), temp)
+        temp = np.array(temp)
+        prim_vars[a2d.DUAL_POW3D] = temp
+        idx += 3 * num_dpow
+    num_psd = len(K_dir[a2d.PSD])
+    if num_psd > 0:
+        psd_vars = []
+        for j, dim in enumerate(K_dir[a2d.PSD]):
+            xj = [0.0] * (dim * (dim + 1) // 2)
+            task.getbarxj(sol, j, xj)
+        prim_vars[a2d.PSD] = np.array(xj)
+    return prim_vars
+
+
 @ray.remote
-def solve_wrapper(A, b, c, cone_dict, warm_start, mode, kwargs):
+def solve_wrapper(A, b, c, cone_dict, warm_start, dualized_data, mode, kwargs):
     """A wrapper around solve_and_derivative for the batch function."""
-    return solve(A, b, c, cone_dict, warm_start=warm_start, mode=mode, **kwargs)
+    return solve(
+        A,
+        b,
+        c,
+        cone_dict,
+        warm_start=warm_start,
+        dualized_data=dualized_data,
+        mode=mode,
+        **kwargs,
+    )
 
 
 def solve_batch(
@@ -28,6 +95,7 @@ def solve_batch(
     bs,
     cs,
     cone_dicts,
+    dualized_data,
     n_jobs_forward=-1,
     n_jobs_backward=-1,
     mode="lsqr",
@@ -81,7 +149,14 @@ def solve_batch(
         xs, ys, ss, Ds, DTs = [], [], [], [], []
         for i in range(batch_size):
             x, y, s = solve(
-                As[i], bs[i], cs[i], cone_dicts[i], warm_starts[i], mode=mode, **kwargs
+                As[i],
+                bs[i],
+                cs[i],
+                cone_dicts[i],
+                dualized_data[i],
+                warm_starts[i],
+                mode=mode,
+                **kwargs,
             )
             xs += [x]
             ys += [y]
@@ -91,9 +166,9 @@ def solve_batch(
         # os.environ["OMP_NUM_THREADS"] = f"4"
 
         args = [
-            (A, b, c, cone_dict, warm_start, mode, kwargs)
-            for A, b, c, cone_dict, warm_start in zip(
-                As, bs, cs, cone_dicts, warm_starts
+            (A, b, c, cone_dict, warm_start, d_data, mode, kwargs)
+            for A, b, c, cone_dict, warm_start, d_data in zip(
+                As, bs, cs, cone_dicts, warm_starts, dualized_data
             )
         ]
 
@@ -110,7 +185,15 @@ class SolverError(Exception):
 
 
 def solve(
-    A, b, c, cone_dict, warm_start=None, mode="lsqr", solve_method="SCS", **kwargs
+    A,
+    b,
+    c,
+    cone_dict,
+    dualized_data,
+    warm_start=None,
+    mode="lsqr",
+    solve_method="SCS",
+    **kwargs,
 ):
     """Solves a cone program, returns its derivative as an abstract linear map.
 
@@ -179,6 +262,7 @@ def solve(
         b,
         c,
         cone_dict,
+        dualized_data,
         warm_start=warm_start,
         mode=mode,
         solve_method=solve_method,
@@ -195,6 +279,7 @@ def solve_internal(
     b,
     c,
     cone_dict,
+    dualized_data,
     solve_method=None,
     warm_start=None,
     mode="lsqr",
@@ -223,6 +308,8 @@ def solve_internal(
     # eliminate explicit zeros in A, we no longer need them
     A.eliminate_zeros()
 
+    solve_method = "MOSEK"
+
     if solve_method is None:
         psd_cone = ("s" in cone_dict) and (cone_dict["s"] != [])
         ep_cone = ("ep" in cone_dict) and (cone_dict["ep"] != 0)
@@ -231,8 +318,97 @@ def solve_internal(
             solve_method = "SCS"
         else:
             solve_method = "ECOS"
+    if solve_method == "MOSEK":
+        import mosek
 
-    if solve_method == "SCS":
+        STATUS_MAP = {
+            mosek.solsta.optimal: cp_settings.OPTIMAL,
+            mosek.solsta.integer_optimal: cp_settings.OPTIMAL,
+            mosek.solsta.prim_feas: cp_settings.OPTIMAL_INACCURATE,  # for integer problems
+            mosek.solsta.prim_infeas_cer: cp_settings.INFEASIBLE,
+            mosek.solsta.dual_infeas_cer: cp_settings.UNBOUNDED,
+        }
+        # "Near" statuses only up to Mosek 8.1
+        if hasattr(mosek.solsta, "near_optimal"):
+            STATUS_MAP[mosek.solsta.near_optimal] = cp_settings.OPTIMAL_INACCURATE
+            STATUS_MAP[
+                mosek.solsta.near_integer_optimal
+            ] = cp_settings.OPTIMAL_INACCURATE
+            STATUS_MAP[
+                mosek.solsta.near_prim_infeas_cer
+            ] = cp_settings.INFEASIBLE_INACCURATE
+            STATUS_MAP[
+                mosek.solsta.near_dual_infeas_cer
+            ] = cp_settings.UNBOUNDED_INACCURATE
+        STATUS_MAP = defaultdict(lambda: s.SOLVER_ERROR, STATUS_MAP)
+
+        solver_output = MOSEK().solve_via_data(
+            dualized_data,
+            warm_start=None,
+            verbose=False,
+            solver_opts={
+                "mosek_params": {
+                    # "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": 1.0e-12,
+                    # "MSK_DPAR_INTPNT_CO_TOL_PFEAS": 1.0e-12,
+                    # "MSK_DPAR_SEMIDEFINITE_TOL_APPROX": 1.0e-12,
+                }
+            },
+        )
+        env = solver_output["env"]
+        task = solver_output["task"]
+        solver_opts = solver_output["solver_options"]
+
+        if task.getnumintvar() > 0:
+            sol_type = mosek.soltype.itg
+        elif "bfs" in solver_opts and solver_opts["bfs"] and task.getnumcone() == 0:
+            sol_type = mosek.soltype.bas  # the basic feasible solution
+        else:
+            sol_type = mosek.soltype.itr  # the solution found via interior point method
+
+        prim_vars = None
+        dual_vars = None
+        problem_status = task.getprosta(sol_type)
+        if sol_type == mosek.soltype.itg and problem_status == mosek.prosta.prim_infeas:
+            status = s.INFEASIBLE
+            prob_val = np.inf
+            raise SolverError("Solver scs returned status infeasible")
+        else:
+            solsta = task.getsolsta(sol_type)
+            status = STATUS_MAP[solsta]
+            prob_val = np.NaN
+            if status in cp_settings.SOLUTION_PRESENT:
+                prob_val = task.getprimalobj(sol_type)
+                prim_vars = recover_primal_variables(
+                    task, sol_type, dualized_data["K_dir"]
+                )
+                dual_vars = MOSEK.recover_dual_variables(task, sol_type)
+            # Delete the mosek Task and Environment
+            task.__exit__(None, None, None)
+            env.__exit__(None, None, None)
+
+            result = {}
+            result["x"] = dual_vars["eq_dual"]
+            result["y"] = np.array([])
+            # print(prim_vars)
+            if "+" in result:
+                result["y"] = prim_vars["+"]
+            if "fr" in prim_vars:
+                result["y"] = np.append(prim_vars["fr"], result["y"])
+            if "q" in prim_vars:
+                for d in prim_vars["q"]:
+                    result["y"] = np.append(result["y"], d)
+            if "s" in prim_vars:
+                for d in prim_vars["s"]:
+                    result["y"] = np.append(result["y"], d)
+
+            # # print(prim_vars)
+            s = b - A @ result["x"]
+            result["s"] = s
+
+            # print(result)
+            # print(jere)
+
+    elif solve_method == "SCS":
         data = {"A": A, "b": b, "c": c}
 
         if warm_start is not None:
@@ -263,6 +439,8 @@ def solve_internal(
         x = result["x"]
         y = result["y"]
         s = result["s"]
+        # print(result)
+        # print(here)
     elif solve_method == "ECOS":
         if warm_start is not None:
             raise ValueError("ECOS does not support warmstart.")
