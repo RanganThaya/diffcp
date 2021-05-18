@@ -71,7 +71,8 @@ def recover_primal_variables(task, sol, K_dir):
         for j, dim in enumerate(K_dir[a2d.PSD]):
             xj = [0.0] * (dim * (dim + 1) // 2)
             task.getbarxj(sol, j, xj)
-        prim_vars[a2d.PSD] = np.array(xj)
+            psd_vars.append(np.array(xj))
+        prim_vars[a2d.PSD] = psd_vars
     return prim_vars
 
 
@@ -389,8 +390,8 @@ def solve_internal(
             result = {}
             result["x"] = dual_vars["eq_dual"]
             result["y"] = np.array([])
-            # print(prim_vars)
-            if "+" in result:
+            print(prim_vars.keys())
+            if "+" in prim_vars:
                 result["y"] = prim_vars["+"]
             if "fr" in prim_vars:
                 result["y"] = np.append(prim_vars["fr"], result["y"])
@@ -405,7 +406,6 @@ def solve_internal(
             s = b - A @ result["x"]
             result["s"] = s
 
-            # print(result)
             # print(jere)
 
     elif solve_method == "SCS":
@@ -439,8 +439,8 @@ def solve_internal(
         x = result["x"]
         y = result["y"]
         s = result["s"]
-        # print(result)
-        # print(here)
+        print(result["y"].shape)
+        print(result["y"])
     elif solve_method == "ECOS":
         if warm_start is not None:
             raise ValueError("ECOS does not support warmstart.")
