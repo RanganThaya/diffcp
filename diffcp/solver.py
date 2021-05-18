@@ -6,7 +6,9 @@ from multiprocessing.pool import ThreadPool
 
 import _diffcp
 import cvxpy.settings as cp_settings
+import cvxpy.settings as s
 import ecos
+import mosek
 import numpy as np
 import ray
 import scipy as sp
@@ -76,8 +78,45 @@ def recover_primal_variables(task, sol, K_dir):
     return prim_vars
 
 
+def solve_via_data(data, warm_start, verbose, solver_opts, env, solver_cache=None):
+    import mosek
+
+    if "dualized" in data:
+        if len(data[s.C]) == 0 and len(data["c_bar_data"]) == 0:
+            # primal problem was unconstrained minimization of a linear function.
+            if np.linalg.norm(data[s.B]) > 0:
+                sol = Solution(s.INFEASIBLE, -np.inf, None, None, dict())
+                return {"sol": sol}
+            else:
+                sol = Solution(s.OPTIMAL, 0.0, dict(), {s.EQ_DUAL: data[s.B]}, dict())
+                return {"sol": sol}
+        else:
+            # env = mosek.Env()
+            task = env.Task(0, 0)
+            task = MOSEK._build_dualized_task(task, data)
+    else:
+        if len(data[s.C]) == 0:
+            sol = Solution(s.OPTIMAL, 0.0, dict(), dict(), dict())
+            return {"sol": sol}
+        else:
+            env = mosek.Env()
+            task = env.Task(0, 0)
+            task = MOSEK._build_slack_task(task, data)
+
+    # Set parameters, optimize the Mosek Task, and return the result.
+    save_file = MOSEK.handle_options(env, task, verbose, solver_opts)
+    if save_file:
+        task.writedata(save_file)
+    task.optimize()
+
+    if verbose:
+        task.solutionsummary(mosek.streamtype.msg)
+
+    return {"env": env, "task": task, "solver_options": solver_opts}
+
+
 @ray.remote
-def solve_wrapper(A, b, c, cone_dict, warm_start, dualized_data, mode, kwargs):
+def solve_wrapper(A, b, c, cone_dict, warm_start, dualized_data, mode, env, kwargs):
     """A wrapper around solve_and_derivative for the batch function."""
     return solve(
         A,
@@ -85,6 +124,7 @@ def solve_wrapper(A, b, c, cone_dict, warm_start, dualized_data, mode, kwargs):
         c,
         cone_dict,
         warm_start=warm_start,
+        env=env,
         dualized_data=dualized_data,
         mode=mode,
         **kwargs,
@@ -144,6 +184,7 @@ def solve_batch(
         n_jobs_backward = mp.cpu_count()
     n_jobs_forward = min(batch_size, n_jobs_forward)
     n_jobs_backward = min(batch_size, n_jobs_backward)
+    env = mosek.Env()
 
     if n_jobs_forward == 1:
         # serial
@@ -156,6 +197,7 @@ def solve_batch(
                 cone_dicts[i],
                 dualized_data[i],
                 warm_starts[i],
+                env=env,
                 mode=mode,
                 **kwargs,
             )
@@ -167,7 +209,7 @@ def solve_batch(
         # os.environ["OMP_NUM_THREADS"] = f"4"
 
         args = [
-            (A, b, c, cone_dict, warm_start, d_data, mode, kwargs)
+            (A, b, c, cone_dict, warm_start, d_data, mode, env, kwargs)
             for A, b, c, cone_dict, warm_start, d_data in zip(
                 As, bs, cs, cone_dicts, warm_starts, dualized_data
             )
@@ -192,6 +234,7 @@ def solve(
     cone_dict,
     dualized_data,
     warm_start=None,
+    env=None,
     mode="lsqr",
     solve_method="SCS",
     **kwargs,
@@ -264,6 +307,7 @@ def solve(
         c,
         cone_dict,
         dualized_data,
+        env=env,
         warm_start=warm_start,
         mode=mode,
         solve_method=solve_method,
@@ -281,6 +325,7 @@ def solve_internal(
     c,
     cone_dict,
     dualized_data,
+    env=None,
     solve_method=None,
     warm_start=None,
     mode="lsqr",
@@ -320,7 +365,6 @@ def solve_internal(
         else:
             solve_method = "ECOS"
     if solve_method == "MOSEK":
-        import mosek
 
         STATUS_MAP = {
             mosek.solsta.optimal: cp_settings.OPTIMAL,
@@ -343,15 +387,17 @@ def solve_internal(
             ] = cp_settings.UNBOUNDED_INACCURATE
         STATUS_MAP = defaultdict(lambda: s.SOLVER_ERROR, STATUS_MAP)
 
-        solver_output = MOSEK().solve_via_data(
+        solver_output = solve_via_data(
             dualized_data,
             warm_start=None,
             verbose=False,
+            env=env,
             solver_opts={
                 "mosek_params": {
                     # "MSK_DPAR_INTPNT_CO_TOL_REL_GAP": 1.0e-12,
                     # "MSK_DPAR_INTPNT_CO_TOL_PFEAS": 1.0e-12,
                     # "MSK_DPAR_SEMIDEFINITE_TOL_APPROX": 1.0e-12,
+                    "MSK_IPAR_NUM_THREADS": 4,
                 }
             },
         )
@@ -390,7 +436,7 @@ def solve_internal(
             result = {}
             result["x"] = dual_vars["eq_dual"]
             result["y"] = np.array([])
-            print(prim_vars.keys())
+            # print(prim_vars.keys())
             if "+" in prim_vars:
                 result["y"] = prim_vars["+"]
             if "fr" in prim_vars:
@@ -439,8 +485,8 @@ def solve_internal(
         x = result["x"]
         y = result["y"]
         s = result["s"]
-        print(result["y"].shape)
-        print(result["y"])
+        # print(result["y"].shape)
+        # print(result["y"])
     elif solve_method == "ECOS":
         if warm_start is not None:
             raise ValueError("ECOS does not support warmstart.")
