@@ -115,7 +115,7 @@ def solve_via_data(data, warm_start, verbose, solver_opts, env, solver_cache=Non
     return {"env": env, "task": task, "solver_options": solver_opts}
 
 
-@ray.remote
+# @ray.remote
 def solve_wrapper(A, b, c, cone_dict, warm_start, dualized_data, mode, env, kwargs):
     """A wrapper around solve_and_derivative for the batch function."""
     return solve(
@@ -216,6 +216,17 @@ def solve_batch(
         ]
 
         results = ray.get([solve_wrapper.remote(*arg) for arg in args])
+        pool = ThreadPool(processes=n_jobs_forward)
+        args = [
+            (A, b, c, cone_dict, warm_start, mode, kwargs)
+            for A, b, c, cone_dict, warm_start in zip(
+                As, bs, cs, cone_dicts, warm_starts
+            )
+        ]
+        with threadpool_limits(limits=1):
+            results = pool.starmap(solve_wrapper, args)
+        pool.close()
+        # results = ray.get([solve_wrapper.remote(*arg) for arg in args])
         xs = [r[0] for r in results]
         ys = [r[1] for r in results]
         ss = [r[2] for r in results]
